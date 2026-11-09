@@ -79,7 +79,7 @@ jobs:
           docker build --platform linux/amd64 --build-arg BASE="$CONTROLLER_BASE" \
             --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label org.opencontainers.image.description="EKS Anywhere $EKSA_VERSION cluster controller, patched for Bottlerocket on KVM" \
-            -t "$image" controller
+            -f controller/Containerfile -t "$image" controller
           docker push -q "$image"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image" | cut -d@ -f2)
           echo "image=$image" >> "$GITHUB_OUTPUT"
