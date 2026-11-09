@@ -1,0 +1,46 @@
+From a18ad05359136744ea29f6a975496209e34c318c Mon Sep 17 00:00:00 2001
+From: Jamie Sammons <sammonsjl@gmail.com>
+Date: Sat, 7 Nov 2026 11:19:11 -0600
+Subject: [PATCH] tinkerbell: allow Bottlerocket on Kubernetes 1.29 and later
+
+Upstream rejects Bottlerocket on the Bare Metal provider for Kubernetes
+1.29+, because AWS stopped publishing Bottlerocket bare metal images.
+Drop the limit so a Bottlerocket vmware-k8s image, converted to raw and
+passed as osImageURL, can be installed by Tinkerbell in the KVM lab.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/providers/tinkerbell/validate.go | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/providers/tinkerbell/validate.go b/pkg/providers/tinkerbell/validate.go
+index e661b64..b796a78 100644
+--- a/pkg/providers/tinkerbell/validate.go
++++ b/pkg/providers/tinkerbell/validate.go
+@@ -50,16 +50,16 @@ func validateOsFamily(spec *ClusterSpec) error {
+ 	return nil
+ }
+ 
++// validateK8sVersionForBottleRocketOS only checks that the version parses.
++//
++// Upstream rejects Bottlerocket on Kubernetes 1.29 and later here, because AWS
++// stopped publishing Bottlerocket bare metal images after 1.28. This fork drops
++// that limit so a Bottlerocket vmware-k8s image, converted to raw and given
++// through osImageURL, can be installed by Tinkerbell. See the KVM lab's docs.
+ func validateK8sVersionForBottleRocketOS(kubernetesVersion string) error {
+-	kubeVersionSemver, err := semver.New(kubernetesVersion + ".0")
+-	if err != nil {
++	if _, err := semver.New(kubernetesVersion + ".0"); err != nil {
+ 		return fmt.Errorf("converting kubeVersion %v to semver %v", kubernetesVersion, err)
+ 	}
+-
+-	kube128Semver, _ := semver.New(string(v1alpha1.Kube128) + ".0")
+-	if kubeVersionSemver.GreaterThan(kube128Semver) {
+-		return errors.New("tinkerbell provider does not support K8s version 1.29+ for BottleRocket OS")
+-	}
+ 	return nil
+ }
+ 
+-- 
+2.56.0
+

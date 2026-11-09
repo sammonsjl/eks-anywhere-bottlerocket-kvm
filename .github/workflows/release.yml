@@ -1,0 +1,137 @@
+# Builds everything the KVM lab's Bottlerocket track needs, and publishes it when
+# a tag like v0.26.4-br.1 is pushed:
+#   - eksctl-anywhere, built from EKS Anywhere v0.26.4 with patches/ applied
+#   - the cluster controller image, EKS Anywhere's own with the patched manager
+#   - a bundle override and controller manifest that point at that image
+#   - AWS's Bottlerocket vmware-k8s 1.35 image, converted from OVA to raw
+# Every input from AWS is pinned by hash.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  EKSA_VERSION: v0.26.4
+  EKSA_COMMIT: 990fe1760c4c24e47b92480bdc19676fc4e98a48
+  GO_VERSION: "1.26.10"
+  # EKS Anywhere's release builds set this. It's a public key.
+  LICENSE_PUBLIC_KEY: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE96Xb67YUq+at8gFOioYlf1kxOIPio7i3Y8sFrG3a3sn/MzqQmTO9K82psqOuN+E4NdE8VajOtbyfcLo+Ojax/w==
+  BUNDLE_URL: https://anywhere-assets.eks.amazonaws.com/releases/bundles/128/manifest.yaml
+  BUNDLE_SHA256: df6c0558f4558c5cff6441ef4ce4692d4e729643f47a946f697202f645ddefb7
+  COMPONENTS_URL: https://anywhere-assets.eks.amazonaws.com/releases/bundles/128/artifacts/eks-anywhere/manifests/cluster-controller/v0.26.4/eksa-components.yaml
+  COMPONENTS_SHA256: 38dff3f62e6da0365dbffb0e7fb45b96a2aef9121fa17cf2798a4f6dd2ad09c5
+  CONTROLLER_BASE: public.ecr.aws/eks-anywhere/cluster-controller:v0.26.4-eks-a-128@sha256:b9df8e8fc3fe5decb2e4e0a7e9ce341e9a699ba4e8fec717d2667c60eee70ff5
+  OVA_URL: https://anywhere-assets.eks.amazonaws.com/releases/bundles/128/artifacts/ova/1-35/bottlerocket-v1.35.9-eks-d-1-35-16-eks-a-128-amd64.ova
+  OVA_SHA256: ccaa53e19f839a73cf03f70b2149323ef1c00ccc9c04b23c27d966200fd94501
+  RAW_SHA256: 7c3537f1b688288e047b931153a55aa1bc6915be6bcb0d08808bf0f6d8b05088
+  OS_IMAGE: bottlerocket-vmware-k8s-1-35-x86_64-v1.68.0.img.gz
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fetch EKS Anywhere and apply the patches
+        run: |
+          git clone -q --depth 1 --branch "$EKSA_VERSION" https://github.com/aws/eks-anywhere.git upstream
+          test "$(git -C upstream rev-parse HEAD)" = "$EKSA_COMMIT"
+          git -C upstream apply --verbose "$PWD"/patches/*.patch
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: upstream/go.sum
+
+      - name: Test the patched provider
+        working-directory: upstream
+        run: go test ./pkg/providers/tinkerbell/...
+
+      - name: Build eksctl-anywhere and the controller manager
+        working-directory: upstream
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+          GOTOOLCHAIN: local
+        run: |
+          m=github.com/aws/eks-anywhere
+          lk="-X $m/pkg/validations.LicensePublicKey=$LICENSE_PUBLIC_KEY"
+          go build -trimpath -o bin/eksctl-anywhere -ldflags "$lk -s -w -buildid= -extldflags -static \
+            -X $m/pkg/version.gitVersion=$EKSA_VERSION \
+            -X $m/pkg/manifests/releases.manifestURL=https://anywhere-assets.eks.amazonaws.com/releases/eks-a/manifest.yaml" \
+            $m/cmd/eksctl-anywhere
+          go build -trimpath -o bin/manager -ldflags "$lk -s -w -buildid= -extldflags -static" $m/manager
+          bin/eksctl-anywhere version
+
+      - name: Build and push the controller image
+        id: image
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}/cluster-controller:$GITHUB_REF_NAME
+          cp upstream/bin/manager controller/
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --platform linux/amd64 --build-arg BASE="$CONTROLLER_BASE" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.description="EKS Anywhere $EKSA_VERSION cluster controller, patched for Bottlerocket on KVM" \
+            -t "$image" controller
+          docker push -q "$image"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image" | cut -d@ -f2)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write the bundle override
+        run: |
+          mkdir -p dist aws
+          curl -fsSL -o aws/bundle.yaml "$BUNDLE_URL"
+          curl -fsSL -o aws/eksa-components.yaml "$COMPONENTS_URL"
+          echo "$BUNDLE_SHA256  aws/bundle.yaml" | sha256sum -c -
+          echo "$COMPONENTS_SHA256  aws/eksa-components.yaml" | sha256sum -c -
+          scripts/make-bundle.py aws/bundle.yaml aws/eksa-components.yaml dist \
+            --image "${{ steps.image.outputs.image }}" --digest "${{ steps.image.outputs.digest }}" \
+            --components-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/eksa-components-br.yaml"
+          tar -C upstream/bin -czf "dist/eksctl-anywhere-$GITHUB_REF_NAME-linux-amd64.tar.gz" ./eksctl-anywhere
+
+      - name: Convert the Bottlerocket image
+        run: |
+          sudo apt-get install -y -qq qemu-utils >/dev/null
+          scripts/convert-image.sh "dist/$OS_IMAGE"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          cat > notes.md <<EOF
+          EKS Anywhere $EKSA_VERSION, patched to allow Bottlerocket on the Bare Metal provider for Kubernetes 1.29 and later, for an [EKS Anywhere on KVM lab]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY#readme). **Not supported by AWS.** For a lab, not for anything that matters.
+
+          | | |
+          |---|---|
+          | Controller image | \`$IMAGE@$DIGEST\` |
+          | Upstream source | aws/eks-anywhere \`$EKSA_VERSION\` (\`$EKSA_COMMIT\`) and \`patches/\` |
+          | Bottlerocket image | AWS's \`$(basename "$OVA_URL")\`, sha256 \`$OVA_SHA256\`, converted to raw with no other change. The raw disk's sha256 is \`$RAW_SHA256\` |
+
+          Built by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
+          EOF
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi
+
+      - name: Check the image can be pulled without logging in
+        run: |
+          docker logout ghcr.io
+          if docker manifest inspect "${{ steps.image.outputs.image }}" >/dev/null 2>&1; then
+            echo "The controller image is public."
+          else
+            echo "::warning::The controller image is private, so the lab can't pull it. Make the package public once: Package settings, Change visibility."
+          fi

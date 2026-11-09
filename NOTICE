@@ -1,0 +1,9 @@
+This repository builds modified versions of Amazon EKS Anywhere
+(https://github.com/aws/eks-anywhere), Copyright Amazon.com, Inc. or its
+affiliates. All Rights Reserved. Licensed under the Apache License, Version 2.0.
+The modifications are the files in patches/.
+
+The release's Bottlerocket image is Bottlerocket (https://github.com/bottlerocket-os/bottlerocket),
+as published by AWS for EKS Anywhere, converted from OVA to raw with its contents
+unchanged. Bottlerocket is licensed under the Apache License 2.0 or the MIT
+License, with third-party components under their own licenses.

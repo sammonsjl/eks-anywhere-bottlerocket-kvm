@@ -1,0 +1,5 @@
+# EKS Anywhere's own cluster controller image, with only its manager binary
+# replaced by one built from the patched source. The base is pinned by digest.
+ARG BASE
+FROM ${BASE}
+COPY manager /usr/local/bin/manager
